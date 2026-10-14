@@ -1436,6 +1436,25 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
       continue;
     }
 
+    // Persist before the side effect; never reset another worker's claim.
+    let claimed = false;
+    try {
+      await prisma.dmLog.upsert({
+        where: { automationId_commentId: { automationId: automation.id, commentId: dedupeId } },
+        create: { ...logBase, commenterName, status: "PENDING" },
+        update: {},
+      });
+      claimed = await claimCommentDelivery(automation.id, dedupeId, "dm");
+    } catch (error) {
+      await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
+      throw error;
+    }
+    if (!claimed) {
+      await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
+      continue;
+    }
+
+    let delivered = false;
     try {
       if (sendFollowPrompt) {
         const promptText = renderMessageWithoutLink({
@@ -1461,6 +1480,8 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
           context: "message trigger",
         });
 
+        delivered = true;
+
         // The link has been delivered, so the appreciation follow-up applies
         // here exactly as it does after a button tap. Not scheduled behind the
         // follow prompt — no link went out yet in that branch.
@@ -1482,6 +1503,7 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
         }
       }
 
+      delivered = true;
       await prisma.dmLog.upsert({
         where: {
           automationId_commentId: {
@@ -1493,16 +1515,23 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
           ...logBase,
           commenterName,
           status: "SENT",
+          dmDeliveryUnconfirmed: false,
           dmSentAt: new Date(),
         },
         update: {
           status: "SENT",
+          dmDeliveryUnconfirmed: false,
           dmSentAt: new Date(),
           errorMessage: null,
         },
       });
-    } catch (error) {
-      await releaseWorkspaceDMReservation(
+    } catch (originalError) {
+      // A post-send queue/database failure is UNKNOWN, even if its error type
+      // happens to resemble a provider rejection. Keep the durable claim.
+      const error = delivered
+        ? classifySendError(new Error("Delivery succeeded but result persistence failed"))
+        : classifySendError(originalError);
+      if (isConfirmedSendRejection(error)) await releaseWorkspaceDMReservation(
         automation.workspaceId,
         usage.periodStart
       );
@@ -1517,13 +1546,11 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
           ...logBase,
           commenterName,
           status: "FAILED",
-          attempts: job.attemptsMade + 1,
           errorMessage: formatError(error),
           dmDeliveryUnconfirmed: isDeliveryUnconfirmed(error),
         },
         update: {
           status: "FAILED",
-          attempts: job.attemptsMade + 1,
           errorMessage: formatError(error),
           dmDeliveryUnconfirmed: isDeliveryUnconfirmed(error),
         },

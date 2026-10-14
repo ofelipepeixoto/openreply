@@ -80,10 +80,12 @@ export default function DiagnosticsPage() {
   const { t, label, locale } = useI18n();
   const [data, setData] = useState<DiagnosticsData | null>(null);
   const [loading, setLoading] = useState(true);
+  const [accessDenied, setAccessDenied] = useState(false);
 
   async function refreshDiagnostics() {
     setLoading(true);
     const response = await fetch("/api/admin/diagnostics");
+    setAccessDenied(response.status === 401 || response.status === 403);
     const payload = await response.json();
     if (payload.success) {
       setData(payload.data);
@@ -96,6 +98,7 @@ export default function DiagnosticsPage() {
 
     async function loadInitialDiagnostics() {
       const response = await fetch("/api/admin/diagnostics");
+      if (active) setAccessDenied(response.status === 401 || response.status === 403);
       const payload = await response.json();
       if (active && payload.success) {
         setData(payload.data);
@@ -111,6 +114,10 @@ export default function DiagnosticsPage() {
       active = false;
     };
   }, []);
+
+  if (accessDenied) {
+    return <p role="alert">Diagnostics are restricted to deployment operators.</p>;
+  }
 
   if (loading && !data) {
     return <div className="panel rounded p-8 h-64" />;

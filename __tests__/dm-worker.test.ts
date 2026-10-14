@@ -1161,7 +1161,7 @@ describe("DM Worker — DM keyword trigger", () => {
     );
   });
 
-  it("should release the usage reservation and rethrow when the send fails", async () => {
+  it("retains the usage reservation when the send outcome is unknown", async () => {
     mockSendDirectMessage.mockRejectedValue(new Error("Meta is down"));
 
     const processor = getProcessor();
@@ -1169,10 +1169,7 @@ describe("DM Worker — DM keyword trigger", () => {
       "Meta is down"
     );
 
-    expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledWith(
-      "workspace_123",
-      usagePeriodStart
-    );
+    expect(mockReleaseWorkspaceDMReservation).not.toHaveBeenCalled();
     expect(mockPrisma.dmLog.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
         create: expect.objectContaining({ status: "FAILED" }),
@@ -1763,4 +1760,49 @@ it("retains the public reply claim if sending succeeded but its log write failed
   await process({ ...createMockJob(), id: "next-poll" });
   expect(sendCommentReply).toHaveBeenCalledTimes(1);
   expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
+});
+
+it("keeps the inbound claim across lost result writes and replay", async () => {
+  mockPrisma.automation.findMany.mockResolvedValue([{ ...mockAutomation, dmTriggerEnabled: true, requireFollow: false }]);
+  let claimed = false;
+  mockPrisma.dmLog.findUnique.mockImplementation(async () => claimed ? { status: "PENDING", dmDeliveryUnconfirmed: true } : null);
+  mockPrisma.dmLog.updateMany.mockImplementation(async () => {
+    if (claimed) return { count: 0 };
+    claimed = true;
+    return { count: 1 };
+  });
+  mockPrisma.dmLog.upsert.mockImplementation(async ({ update }) => {
+    if (Object.keys(update).length) throw new Error("synthetic persistence failure");
+    return {};
+  });
+  const process = getProcessor();
+  const job = { name: "process-message", data: { instagramAccountId: "ig_456", messageId: "durable-mid", messageText: "LINK", senderId: "commenter_999" }, id: "durable-message", attemptsMade: 0 };
+  await expect(process(job)).rejects.toThrow("synthetic persistence failure");
+  await process({ ...job, id: "redelivery", attemptsMade: 1 });
+  expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+  expect(mockReleaseWorkspaceDMReservation).not.toHaveBeenCalled();
+});
+
+it("does not send an inbound reply when its durable claim cannot be saved", async () => {
+  mockPrisma.automation.findMany.mockResolvedValue([{ ...mockAutomation, dmTriggerEnabled: true, requireFollow: false }]);
+  mockPrisma.dmLog.updateMany.mockRejectedValue(new Error("claim storage unavailable"));
+  const job = { name: "process-message", data: { instagramAccountId: "ig_456", messageId: "claim-mid", messageText: "LINK", senderId: "commenter_999" }, id: "claim-message", attemptsMade: 0 };
+  await expect(getProcessor()(job)).rejects.toThrow("claim storage unavailable");
+  expect(mockSendDirectMessage).not.toHaveBeenCalled();
+});
+
+it("admits only one concurrent inbound sender for the same durable claim", async () => {
+  mockPrisma.automation.findMany.mockResolvedValue([{ ...mockAutomation, dmTriggerEnabled: true, requireFollow: false }]);
+  mockPrisma.dmLog.upsert.mockResolvedValue({});
+  let claimed = false;
+  mockPrisma.dmLog.updateMany.mockImplementation(async () => {
+    if (claimed) return { count: 0 };
+    claimed = true;
+    return { count: 1 };
+  });
+  const job = { name: "process-message", data: { instagramAccountId: "ig_456", messageId: "concurrent-mid", messageText: "LINK", senderId: "commenter_999" }, id: "concurrent-message", attemptsMade: 0 };
+  const process = getProcessor();
+  await Promise.all([process(job), process({ ...job, id: "concurrent-replay" })]);
+  expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+  expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledTimes(1);
 });

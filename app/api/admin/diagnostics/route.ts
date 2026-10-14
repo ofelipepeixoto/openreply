@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getCurrentWorkspaceId } from "@/lib/auth";
+import { getCurrentUserId, getCurrentWorkspaceId } from "@/lib/auth";
 import { prisma } from "@/lib/db/client";
 import { getDMQueue } from "@/lib/queue/client";
 import { getWorkerAlerts, getWorkerHealth } from "@/lib/ops/worker-health";
@@ -12,6 +12,17 @@ export async function GET() {
     return NextResponse.json(
       { success: false, error: "Unauthorized" },
       { status: 401 }
+    );
+  }
+
+  // Global queue/worker telemetry is reserved for deployment operators.
+  // A workspace OWNER/ADMIN is not a platform operator.
+  const userId = await getCurrentUserId();
+  const operators = (process.env.OPENREPLY_OPERATOR_USER_IDS ?? "")
+    .split(",").map(value => value.trim()).filter(Boolean);
+  if (!userId || !operators.includes(userId)) {
+    return NextResponse.json(
+      { success: false, error: "Operator access required" }, { status: 403 }
     );
   }
 
