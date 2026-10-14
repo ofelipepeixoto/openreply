@@ -1806,3 +1806,29 @@ it("admits only one concurrent inbound sender for the same durable claim", async
   expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
   expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledTimes(1);
 });
+
+it("retains a follow-up claim after an unknown outcome and queue redelivery", async () => {
+  mockPrisma.automation.findFirst.mockResolvedValue({ ...mockAutomation, followUpEnabled: true, followUpMessage: "Thanks" });
+  const claims = new Set<string>();
+  mockPrisma.postbackDelivery.create.mockImplementation(async ({ data }) => {
+    if (claims.has(data.id)) throw { code: "P2002" };
+    claims.add(data.id);
+  });
+  mockSendDirectMessage.mockRejectedValue(new Error("response lost"));
+  const job = { name: "process-followup", data: { instagramAccountId: "ig_456", userId: "commenter_999", automationId: "auto_789", deliveryOperationId: "source-event-a" }, id: "followup-job", attemptsMade: 0 };
+  const process = getProcessor();
+  await process(job);
+  expect(mockReleaseWorkspaceDMReservation).not.toHaveBeenCalled();
+  await process({ ...job, id: "recreated-queue-job" });
+  expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+  expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledTimes(1);
+  expect(mockPrisma.postbackDelivery.delete).not.toHaveBeenCalled();
+});
+
+it("does not send follow-up when claim persistence fails", async () => {
+  mockPrisma.automation.findFirst.mockResolvedValue({ ...mockAutomation, followUpEnabled: true, followUpMessage: "Thanks" });
+  mockPrisma.postbackDelivery.create.mockRejectedValue(new Error("storage unavailable"));
+  await getProcessor()({ name: "process-followup", data: { instagramAccountId: "ig_456", userId: "commenter_999", automationId: "auto_789" }, id: "legacy-followup", attemptsMade: 0 });
+  expect(mockSendDirectMessage).not.toHaveBeenCalled();
+  expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledTimes(1);
+});

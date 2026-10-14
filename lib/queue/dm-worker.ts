@@ -1,3 +1,4 @@
+import { sendClaimedOnce as sendPostbackOnce } from "./delivery-claim";
 import {
   classifySendError,
   hasLegacyUnconfirmedDelivery,
@@ -799,39 +800,6 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
   }
 }
 
-async function sendPostbackOnce({
-  operationId,
-  send,
-}: {
-  operationId: string;
-  send: () => Promise<unknown>;
-}): Promise<boolean> {
-  try {
-    await prisma.postbackDelivery.create({ data: { id: operationId } });
-  } catch (error) {
-    if (
-      typeof error === "object" &&
-      error !== null &&
-      "code" in error &&
-      error.code === "P2002"
-    )
-      return false;
-    throw error;
-  }
-  try {
-    await send();
-    return true;
-  } catch (error) {
-    // A durable claim survives queue eviction, concurrent redelivery, and a
-    // process crash during delivery. Only confirmed rejections permit retry.
-    if (isConfirmedSendRejection(error)) {
-      await prisma.postbackDelivery.delete({ where: { id: operationId } });
-      throw error;
-    }
-    throw classifySendError(error);
-  }
-}
-
 // Tells someone whose "I'm following" tap is being re-checked that it is being
 // looked at, so the chat does not sit silent while Instagram catches up with
 // the follow. Opt-in through FOLLOW_RECHECK_ACK_MESSAGE, and best-effort: it
@@ -1139,6 +1107,7 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
           userId,
           automationId: automation.id,
           commenterName,
+          deliveryOperationId: operationId,
         },
         {
           delay: delayMs,
@@ -1250,8 +1219,20 @@ async function processFollowUp(job: Job<ProcessFollowUpJob>): Promise<void> {
     return;
   }
 
+  // New jobs carry the source event identity; legacy jobs retain their stable
+  // queue identity. Do not use timestamps: replay must preserve the claim key.
+  const sourceId = job.data.deliveryOperationId ?? job.id;
+  if (!sourceId) return;
+  const operationId = "followup:" + createHash("sha256").update(JSON.stringify([
+    automation.workspaceId, automation.instagramAccountId, automation.id, userId, sourceId,
+  ])).digest("hex");
+  const usage = await reserveWorkspaceDMSend(automation.workspaceId);
+  if (!usage.allowed) return;
+  let attempted = false;
   try {
-    await sendDirectMessage({
+    const delivered = await sendPostbackOnce({ operationId, send: () => {
+      attempted = true;
+      return sendDirectMessage({
       context: accessToken,
       instagramAccountId: automation.instagramAccount.instagramId,
       userId: userId,
@@ -1259,12 +1240,17 @@ async function processFollowUp(job: Job<ProcessFollowUpJob>): Promise<void> {
         message: automation.followUpMessage,
         commenterName: commenterName ?? null,
       }),
-    });
+      });
+    } });
+    if (!delivered) await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
   } catch (error) {
-    console.log(
-      "[DM Worker] Failed to send follow-up message:",
-      formatError(error)
-    );
+    if (!attempted || isConfirmedSendRejection(error)) {
+      await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
+    }
+    // Log a category only; provider errors can contain customer content.
+    console.log("[DM Worker] Follow-up delivery stopped", {
+      outcome: isDeliveryUnconfirmed(error) ? "UNKNOWN" : "FAILED",
+    });
   }
 }
 
@@ -1494,6 +1480,7 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
               userId: senderId,
               automationId: automation.id,
               commenterName,
+              deliveryOperationId: dedupeId,
             },
             {
               delay: Math.max(0, automation.followUpDelayMinutes ?? 0) * 60_000,

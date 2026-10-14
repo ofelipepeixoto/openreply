@@ -14,6 +14,7 @@ import type { Locale } from "@/lib/i18n";
 import { useI18n } from "@/lib/i18n/provider";
 import { useCallback, useEffect, useRef, useState } from "react";
 import AccountSelect, { type AccountOption } from "@/components/account-select";
+import { pendingSend } from "@/lib/pending-send";
 import { readCache, writeCache } from "@/lib/client-cache";
 import type { ConversationListItem } from "@/app/api/instagram/conversations/route";
 import type { ThreadMessage } from "@/app/api/instagram/conversations/[id]/route";
@@ -227,9 +228,11 @@ export default function InboxPage() {
     setDraft("");
 
     try {
+      // If storage fails, fail before sending rather than lose the retry key.
+      const pending = await pendingSend(sessionStorage, [selectedAccountId, active.contact.id, text]);
       const res = await fetch("/api/instagram/conversations", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "Idempotency-Key": pending.id },
         body: JSON.stringify({
           instagramAccountId: selectedAccountId,
           recipientId: active.contact.id,
@@ -240,6 +243,7 @@ export default function InboxPage() {
       if (data.success) {
         await loadMessages(active.id, true);
         void loadConversations(true);
+        sessionStorage.removeItem(pending.storageKey);
       } else {
         // Roll the optimistic message back and restore the draft so it's not lost.
         setMessages((prev) => prev.filter((m) => m.id !== optimistic.id));

@@ -24,8 +24,8 @@ over guaranteed delivery: a crash between claiming and sending can leave an
 unsent UNKNOWN. Operators must reconcile with provider evidence, never blindly
 clear claims. No database migration or production database access is included.
 
-Scope remaining: manual conversation sends and appreciation follow-ups still
-need the same durable delivery policy. This is not an exactly-once guarantee.
+At the end of batch 1, manual conversation sends and appreciation follow-ups
+still needed the same durable delivery policy (addressed in batch 2 below). This is not an exactly-once guarantee.
 DB atomicity is based on the existing conditional update, not demonstrated by
 mock tests; a real isolated PostgreSQL concurrency test remains a release gate.
 
@@ -54,7 +54,7 @@ No adapter is connected to Hub, Portal, customer accounts or a live dispatcher.
 1. Install/generate/typecheck/lint/test/build at the proposed commit.
 2. Isolated PostgreSQL + Redis crash/concurrency tests, including failure after
    send and before persistence; no live messages.
-3. Cover manual and follow-up paths, request size limits and provider timeouts.
+3. Validate manual and follow-up paths in staging; add request size limits and provider timeouts.
 4. Resolve reachable critical/high advisories and document exceptions by path.
 5. Separately authorized staging with synthetic accounts, reconciliation UI,
    operator audit trail, alerts and rollback drill before production approval.
@@ -82,3 +82,56 @@ With Next/eslint-config-next 16.3.8, next-auth 5.0.0-beta.32,
 The test process used dummy local service URLs and blocked Node transports;
 no PostgreSQL, Redis, SMTP or provider round trip was executed. Local test logs
 are retained separately and are not part of this public fork.
+
+## Batch 2 continuation: manual and follow-up claims
+
+Manual sends now require `Idempotency-Key` (16–128 ASCII letters, digits, `_`,
+`-`). A claim is scoped to authenticated workspace + account + request ID;
+reusing a key with changed content is also blocked. The inbox persists an opaque
+key under a digest of account/recipient/content in sessionStorage, retaining it
+on lost responses and page reloads. Successful completion removes that pending
+key. Clearing browser storage, a new tab, or editing the message can represent a
+new operation: this is not cross-browser semantic deduplication.
+
+Manual, postback and follow-up sends reuse one PostbackDelivery claim helper.
+Its existing primary key is the atomic admission boundary. A retained row means
+SENT **or** UNKNOWN; the existing schema does not distinguish these states, so
+replay is rejected conservatively with an UNKNOWN reconciliation instruction,
+not reported as successful. Only an explicit provider rejection deletes a claim.
+Claim-write failure prevents sending. A crash after claim and before send can
+suppress an unsent operation; a crash after send cannot automatically repeat it.
+There is no atomic transaction across PostgreSQL and the external provider.
+
+Follow-up jobs carry their parent event operation ID, so queue recreation keeps
+the same durable claim. Legacy jobs fall back to their stable queue ID. The
+existing coalescing queue job ID remains unchanged. Usage is reserved for manual
+and follow-up sends; UNKNOWN retains the reservation. A crash between reserving
+usage and claiming can conservatively leak one reservation; transactional quota
+and claim reconciliation remains a production gate. No claims expire or get
+reset automatically, and deleting claim records can re-enable replay.
+
+The database constraints are CODE VERIFIED in existing migrations. Synthetic
+concurrency/crash-boundary tests are TEST VERIFIED, but actual PostgreSQL crash
+recovery and durability settings are NOT VERIFIED. No schema migration ran.
+
+### Hub adapter decision
+
+The unchanged Hub at d7084bdf63fcea9cf13ad1c5b3254c828b2cb6e2 only accepts
+`draft.public-sources.review` and `ai.draft.preview` in its governance action
+allowlist. Neither authorizes a DM. The Portal at
+6acae7ad977cef31eef0d284a7bcffa40e9f20ba binds approvals to a version/content hash
+but does not define this delivery contract. An adapter claiming safe executable
+integration would need a new action, tenant mapping and authenticated principal
+contract. No adapter was added: those are architectural decisions for the
+existing governance owner, not reasons to duplicate an approval engine here.
+
+### Batch 2 executed validation
+
+Clean `npm ci --ignore-scripts` passed after the compatible transitive lock
+updates. Full test command executed 337 passing tests in 29 files; the same
+three Prisma-import suites still fail to load. Lint exits 0 with one existing
+navigation warning. Typecheck still fails on the missing generated client and
+its dependent types; no typecheck/build success is claimed. The prior Prisma
+HTTP403 is preserved without retry or checksum bypass. See
+[dependency triage](DEPENDENCY-TRIAGE.md) for all 18 original high entries and
+why 13 remain after this batch. No real DB/provider/SMTP/Redis calls were made.

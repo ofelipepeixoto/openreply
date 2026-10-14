@@ -1,3 +1,7 @@
+import { createHash } from "node:crypto";
+import { sendClaimedOnce } from "@/lib/queue/delivery-claim";
+import { isConfirmedSendRejection } from "@/lib/instagram/delivery-errors";
+import { reserveWorkspaceDMSend, releaseWorkspaceDMReservation } from "@/lib/billing/usage";
 import { NextRequest, NextResponse } from "next/server";
 import { getCurrentWorkspaceId } from "@/lib/auth";
 import { getWorkspaceInstagramAccount } from "@/lib/instagram-accounts";
@@ -123,8 +127,13 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const text = body.text?.trim();
-  if (!body.recipientId || !text) {
+  const text = typeof body?.text === "string" ? body.text.trim() : "";
+  const requestId = request.headers.get("Idempotency-Key");
+  if (!requestId || !/^[a-zA-Z0-9_-]{16,128}$/.test(requestId)) {
+    return NextResponse.json({ success: false, error: "A valid Idempotency-Key is required." }, { status: 400 });
+  }
+  if (typeof body?.recipientId !== "string" || !body.recipientId || body.recipientId.length > 128 || !text || text.length > 4096 ||
+      (body.instagramAccountId !== undefined && typeof body.instagramAccountId !== "string")) {
     return NextResponse.json(
       { success: false, error: "A recipient and message are required." },
       { status: 400 }
@@ -142,24 +151,43 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  const operationId = "manual:" + createHash("sha256").update(JSON.stringify([
+    workspaceId, account.id, requestId,
+  ])).digest("hex");
+  let accessToken;
   try {
-    const accessToken = await createInstagramContext(account);
-    const result = await sendDirectMessage({
-      context: accessToken,
-      instagramAccountId: account.instagramId,
-      userId: body.recipientId,
-      message: text,
-    });
+    accessToken = await createInstagramContext(account, operationId);
+  } catch {
+    return NextResponse.json({ success: false, error: "Account credentials unavailable." }, { status: 503 });
+  }
+  const usage = await reserveWorkspaceDMSend(workspaceId);
+  if (!usage.allowed) {
+    return NextResponse.json({ success: false, error: "Workspace send limit reached." }, { status: 429 });
+  }
+  let attempted = false;
+  try {
+    let result: unknown;
+    const delivered = await sendClaimedOnce({ operationId, send: async () => {
+      attempted = true;
+      result = await sendDirectMessage({
+        context: accessToken,
+        instagramAccountId: account.instagramId,
+        userId: body.recipientId!,
+        message: text,
+      });
+    } });
+    if (!delivered) {
+      await releaseWorkspaceDMReservation(workspaceId, usage.periodStart);
+      return NextResponse.json({ success: false, outcome: "UNKNOWN", error: "This send was already claimed. Inspect the inbox before composing another message." }, { status: 409 });
+    }
     return NextResponse.json({ success: true, data: result });
   } catch (err) {
-    console.error("[Conversations] Send error:", err);
-    // Surface Meta's own message — the common case is the 24-hour messaging
-    // window having closed, which the user needs to see explicitly.
-    const message =
-      err instanceof MetaApiError ? err.message : "Failed to send message";
-    return NextResponse.json(
-      { success: false, error: message },
-      { status: 502 }
-    );
+    if (!attempted || isConfirmedSendRejection(err)) {
+      await releaseWorkspaceDMReservation(workspaceId, usage.periodStart);
+    }
+    const unknown = attempted && !isConfirmedSendRejection(err);
+    return NextResponse.json({ success: false, outcome: unknown ? "UNKNOWN" : "FAILED",
+      error: unknown ? "Delivery is unconfirmed. Inspect the inbox before composing another message." : "Message could not be sent." },
+      { status: unknown ? 409 : 502 });
   }
 }
