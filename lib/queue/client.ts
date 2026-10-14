@@ -60,6 +60,7 @@ export interface ProcessPostbackJob {
 // Enqueued with a delay (followUpDelayMinutes) so it can fire later, not just
 // immediately.
 export interface ProcessFollowUpJob {
+  deliveryOperationId?: string;
   accountConnectionId?: string;
   instagramAccountId: string;
   userId: string;
